@@ -1,0 +1,974 @@
+---
+title: 
+author: "Jessie Tian"
+date: 
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readr)
+library(rms)
+library(lattice)
+library(dplyr)
+library(tidyr)
+library(survival)
+library(ggplot2)
+library(skimr)
+library(naniar)
+library(survival)
+library(survminer)
+library(lubridate)
+library(mice)
+library(gtsummary)
+library(dplyr)
+
+require("knitr")
+```
+
+
+```{r}
+
+setwd("~/Desktop/OTRU/Quit Vaping App ")
+stopvape <- read_csv("unimputed_dataset_allages.csv", col_names = TRUE)
+
+stopvape.dd <- datadist(stopvape)
+options(datadist="stopvape.dd")
+
+stopvape_complete <- na.omit(stopvape)
+sum(is.na(stopvape_complete))
+
+
+#Complete cases 
+nrow(stopvape[!complete.cases(stopvape), ])/nrow(stopvape)*100
+
+#Incomplete cases 17.82%
+stopvape_comp <- stopvape[complete.cases(stopvape),]
+# df_comp$wave <- NULL
+#n=5,288, p=37
+
+
+
+```
+
+
+ecusv_3: Confidence in quitting vaping within next month on a scale of 1-10
+ecu17_1: Intention to quit at baseline (0= yes, but within next 6 months or beyond 6 months, 1= within next month,)
+ecusv_2: Past-year quit attempts (0= no, 1=yes)
+mhealth1_1: Perceived mental heath status (0= fair or poor, 1= good, very good, or excellent)
+
+# prepare data
+```{r}
+# Convert categorical variables to a factor with proper labels
+stopvape$gender_adj <- factor(stopvape$gender,
+                            levels = c(0, 1, 2),
+                            labels = c("Men", "Women", "Others"))
+stopvape$sexorient_adj <- factor(stopvape$sexorient,
+                               levels = c(0, 1, 2),
+                               labels = c("Heterosexual", "LGBTQ", "Asexual/Undisclosed"))
+
+stopvape <- stopvape %>%
+  mutate(age = ifelse(nchar(as.character(age)) > 3, NA, age))
+
+
+summary(stopvape$age)
+```
+
+# Descriptive table
+```{r}
+
+#split into groups low and high quitting confidence 
+stopvape$conf_group <- cut(stopvape$ecusv_3,
+                           breaks = c(0, 5, 10),
+                           labels = c("Low", "High"),
+                           right = TRUE)
+
+# Get descriptive statistics for unique user IDs only
+stopvape %>%
+  distinct(userid, .keep_all = TRUE) %>%  # Keep only unique userids
+  tbl_summary(
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n}  ({p}%)"
+    )
+  )
+
+# Filter to unique user IDs, create confidence groups, and get descriptive statistics
+stopvape %>%
+  distinct(userid, .keep_all = TRUE) %>%  # Keep only unique userids
+  mutate(conf_group = cut(ecusv_3,
+                         breaks = c(0, 5, 10),
+                         labels = c("Low", "High"),
+                         right = TRUE)) %>%
+  tbl_summary(
+    by = conf_group,  # Group by confidence level
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    )
+  ) %>%
+  add_p() %>%        # Add p-values for group comparisons
+  add_overall()      # Add overall column
+
+
+# Select specific variables and group by confidence
+stopvape %>%
+  distinct(userid, .keep_all = TRUE) %>%
+  mutate(conf_group = cut(ecusv_3,
+                         breaks = c(0, 5, 10),
+                         labels = c("Low", "High"),
+                         right = TRUE)) %>%
+  select(age,gender,sexorient,race,status, Time.elapsed, ecu17_1, ecusv_2, ecusv_3, mhealth1_1, conf_group) %>%
+  tbl_summary(
+    by = conf_group,
+    statistic = list(
+      all_continuous() ~ "{median} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    )
+  ) %>%
+  add_p() %>%
+  add_overall()
+
+# Calculate statistics using unique user_id
+quit_stats <- stopvape %>%
+  group_by(userid) %>%
+  summarise(
+    quit_attempts = n(),  # Count records per user (each record = 1 attempt)
+    .groups = 'drop'
+  )
+
+# Calculate final statistics
+final_stats <- quit_stats %>%
+  summarise(
+    # Average number of quit attempts per participant
+    avg_quit_attempts = mean(quit_attempts),
+    # Number of participants with only one challenge
+    participants_one_challenge = sum(quit_attempts == 1),
+    # Maximum number of challenges completed
+    max_challenges = max(quit_attempts)
+  )
+
+print(final_stats)
+
+
+# Count how many times each userid appears (number of challenges per user)
+user_challenge_counts <- table(stopvape$userid)
+
+```
+```{r}
+episode_counts <- stopvape %>%
+  group_by(userid) %>%
+  summarise(
+    n_episodes = n(),
+    .groups = "drop"
+  )
+
+summary(episode_counts$n_episodes)
+
+episode_distribution <- episode_counts %>%
+  count(n_episodes) %>%
+  mutate(
+    percent = n / sum(n) * 100
+  )
+
+episode_distribution
+
+repeat_summary <- episode_counts %>%
+  summarise(
+    total_participants = n(),
+    repeat_participants = sum(n_episodes > 1),
+    repeat_percent = repeat_participants / total_participants * 100
+  )
+
+repeat_summary
+
+
+repeat_contribution <- stopvape %>%
+  left_join(episode_counts, by = "userid") %>%
+  summarise(
+    total_episodes = n(),
+    episodes_repeat = sum(n_episodes > 1),
+    percent_repeat = episodes_repeat / total_episodes * 100
+  )
+
+repeat_contribution
+
+library(ggplot2)
+
+ggplot(episode_counts, aes(x = n_episodes)) +
+  geom_bar() +
+  labs(
+    x = "Number of Quit Challenges per Participant",
+    y = "Number of Participants",
+    title = "Distribution of Quit Challenge Episodes per Participant"
+  )
+
+
+
+```
+
+
+# Missing data and multiple imputations (pattern of missingness)
+```{r}
+
+skim(stopvape)
+summary(stopvape, na.rm = TRUE) 
+stopvape$userid <- as.factor(stopvape$userid)
+
+selected_vars <- stopvape %>% select(Time.elapsed, status, ecusv_3, age, gender_adj)
+
+# Select the variables of interest
+selected_vars <- stopvape %>% 
+  select(Time.elapsed, status, ecusv_3, age, gender_adj, ecu17_1, ecusv_2, mhealth1_1)
+
+# Create a summary of missing values
+missing_summary <- selected_vars %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%  # count missing per column
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Missing_Count") %>%
+  mutate(Total = nrow(stopvape),
+         Missing_Percent = round((Missing_Count / Total) * 100, 2))
+
+missing_summary
+
+
+
+# Explore patterns of missing data
+na.pat <- naclus(stopvape[,-1])
+naplot(na.pat)
+
+vis_miss(stopvape) #display entire dataset to find missing, if sort by time, can see if time dependent missingness throughout study
+gg_miss_var(stopvape) # give number missing sorted
+gg_miss_var(stopvape, show_pct = TRUE) # shown as percentage
+gg_miss_case(stopvape)
+
+# gg_miss_upset(stopvape) # see what is missing when other variables are missing
+n_var_miss(stopvape) #max number missing is 23 variables
+
+ggplot(
+  data = stopvape,
+  mapping = aes(x = Time.elapsed, y = ecusv_3)) +     
+  geom_miss_point()
+
+stopvape$age[stopvape$age== 5198023886] <- NA
+
+### Generate 5 imputed data sets
+
+(v <- names(stopvape)[c(2,14, 32, 33, 43, 44, 42, 12, 13, 28, 40, 41)])
+
+# md.pattern(stopvape[,v], rotate.names = TRUE)
+
+set.seed(3098) 
+stopvape.mice <- mice(stopvape[,v], m = 5, method = "cart") # large number of unbalanced factor variables, use cart method 
+stopvape.mice$method["userid"] <- ""
+
+# Prevent userid from being imputed
+
+stopvape.mice$method
+plot(stopvape.mice)
+
+densityplot(stopvape.mice) # for continuous variables
+densityplot(stopvape.mice, ~ ecusv_3|.imp) #look at self-confidence by imputation
+
+
+```
+
+
+
+```{r}
+# Unadjusted model
+fit1 <- with(
+  stopvape.mice,
+  coxph(
+    Surv(Time.elapsed, status) ~ ecusv_3 +
+    cluster(userid)
+  )
+)
+pooled_fit1 <- pool(fit1)
+
+summary(
+  pooled_fit1,
+  conf.int = TRUE,
+  exponentiate = TRUE
+)
+
+# Adjusted model
+
+fit2 <- with(
+  stopvape.mice,
+  coxph(
+    Surv(Time.elapsed, status) ~
+      ecusv_3 +
+      age +
+      country +
+      gender_adj +
+      sexorient_adj +
+      race +
+      ecu17_1 +
+      ecusv_2 +
+      mhealth1_1 +
+      cluster(userid)
+  )
+)
+
+pooled_fit2 <- pool(fit2)
+
+summary(
+  pooled_fit2,
+  conf.int = TRUE,
+  exponentiate = TRUE
+)
+
+
+# Interaction model (gender × quitting confidence)
+
+fit3 <- with(
+  stopvape.mice,
+  coxph(
+    Surv(Time.elapsed, status) ~
+      ecusv_3 * gender_adj +
+      age +
+      country +
+      sexorient_adj +
+      race +
+      ecu17_1 +
+      ecusv_2 +
+      mhealth1_1 +
+      cluster(userid)
+  )
+)
+
+pooled_fit3 <- pool(fit3)
+
+summary(
+  pooled_fit3,
+  conf.int = TRUE,
+  exponentiate = TRUE
+)
+
+# Demographic adjustment model
+
+fitdemo <- with(
+  stopvape.mice,
+  coxph(
+    Surv(Time.elapsed, status) ~
+      ecusv_3 +
+      age +
+      country +
+      gender_adj +
+      sexorient_adj +
+      race +
+      cluster(userid)
+  )
+)
+
+pooled_fitdemo <- pool(fitdemo)
+
+summary(
+  pooled_fitdemo,
+  conf.int = TRUE,
+  exponentiate = TRUE
+)
+
+#########################
+# Adjusted model
+
+fit_strata <- with(
+  stopvape.mice,
+  coxph(
+    Surv(Time.elapsed, status) ~
+      ecusv_3 +
+      age +
+      strata(country) +
+      strata(gender_adj) +
+      strata(sexorient_adj) +
+      race +
+      ecu17_1 +
+      strata(ecusv_2) +
+      mhealth1_1 +
+      cluster(userid)
+  )
+)
+
+pooled_fit_strata <- pool(fit_strata)
+
+summary(
+  pooled_fit_strata,
+  conf.int = TRUE,
+  exponentiate = TRUE
+)
+```
+Survival probability for main model 
+```{r}
+###################################################
+### Survival probabilities at 24, 48, 72 hours
+### by confidence group (Low vs High)
+### across all imputed datasets
+###################################################
+
+time_points <- c(1, 2, 3)  # 1, 2, 3 days = 24, 48, 72 hours
+
+surv_probs <- lapply(1:stopvape.mice$m, function(i) {
+  data_i <- complete(stopvape.mice, i)
+  
+  # Create confidence group in each imputed dataset
+  data_i$conf_group <- cut(data_i$ecusv_3,
+                           breaks = c(0, 5, 10),
+                           labels = c("Low", "High"),
+                           right  = TRUE)
+  
+  # Fit KM separately for each confidence group
+  km_fit <- survfit(Surv(Time.elapsed, status) ~ conf_group,
+                    data = data_i)
+  
+  # Extract survival probabilities at each time point
+  km_summary <- summary(km_fit, times = time_points)
+  
+  data.frame(
+    time       = km_summary$time,
+    surv       = km_summary$surv,
+    lower      = km_summary$lower,
+    upper      = km_summary$upper,
+    conf_group = km_summary$strata,
+    imp        = i
+  )
+})
+
+surv_probs_df <- do.call(rbind, surv_probs)
+
+# Clean up strata label
+surv_probs_df$conf_group <- gsub("conf_group=", "", surv_probs_df$conf_group)
+
+cat("\n-- Raw survival probabilities per imputation --\n")
+print(surv_probs_df)
+
+
+#################
+###################################################
+### Pool using Rubin's rules on log(-log(S)) scale
+### This is the recommended scale for pooling
+### survival probabilities (more stable than
+### pooling S directly)
+###################################################
+
+surv_pooled <- surv_probs_df %>%
+  group_by(time, conf_group) %>%
+  summarise(
+    # Rubin's rules on log(-log(S)) scale
+    m          = n(),
+    
+    # Transform to log(-log(S)) for pooling
+    lls        = mean(log(-log(surv))),
+    lls_var    = var(log(-log(surv))),
+    
+    # Within-imputation variance approximation
+    # using delta method on log(-log(S))
+    mean_surv  = mean(surv),
+    sd_surv    = sd(surv),
+    
+    # Simple average (acceptable approximation)
+    surv_avg   = mean(surv),
+    lower_avg  = mean(lower),
+    upper_avg  = mean(upper),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Back-transform pooled log(-log(S)) to survival
+    surv_pooled = exp(-exp(lls)),
+    
+    # Convert time back to hours for reporting
+    time_hours  = time * 24,
+    
+    # Format as percentage
+    surv_pct    = round(surv_avg * 100, 1),
+    lower_pct   = round(lower_avg * 100, 1),
+    upper_pct   = round(upper_avg * 100, 1)
+  )
+
+cat("\n-- Pooled survival probabilities (Low vs High self-efficacy) --\n")
+print(surv_pooled %>% 
+        select(time_hours, conf_group, surv_pct, lower_pct, upper_pct))
+
+```
+
+```{r}
+
+schoenfeld_main <- lapply(1:stopvape.mice$m, function(i) {
+  data_i <- complete(stopvape.mice, i)
+  fit_i <- coxph(Surv(Time.elapsed, status) ~ ecusv_3 + age + country + gender_adj + sexorient_adj + race + ecu17_1 + ecusv_2 + mhealth1_1,
+                 data = data_i)
+  zph_i <- cox.zph(fit_i)
+  data.frame(
+    term    = rownames(zph_i$table),
+    chisq   = zph_i$table[, "chisq"],
+    p_value = zph_i$table[, "p"],
+    imp     = i
+  )
+})
+
+schoenfeld_main_df <- do.call(rbind, schoenfeld_main)
+
+# Summary: mean p-value and proportion significant across imputations
+schoenfeld_main_summary <- schoenfeld_main_df %>%
+  group_by(term) %>%
+  summarise(
+    mean_chisq  = mean(chisq),
+    mean_pvalue = mean(p_value),
+    prop_sig    = mean(p_value < 0.05),
+    .groups = "drop"
+  )
+cat("\n-- Schoenfeld PH Test: Main Dataset --\n")
+print(schoenfeld_main_summary)
+
+# Plot: imputation 1 as representative
+data_1 <- complete(stopvape.mice, 1)
+fit_1 <- coxph(Surv(Time.elapsed, status) ~ ecusv_3 + age + gender_adj +
+                 ecu17_1 + ecusv_2 + mhealth1_1,
+               data = data_1)
+zph_1 <- cox.zph(fit_1)
+
+par(mfrow = c(2, 3))
+plot(zph_1, col = "blue", lwd = 2)
+par(mfrow = c(1, 1))
+
+# ecusv_3 specifically
+plot(zph_1[1],
+     main = "Schoenfeld Residuals — ecusv_3 (Main, Imp 1)")
+abline(h = coef(fit_1)["ecusv_3"], col = "red", lwd = 2, lty = 3)
+plot(zph_1[2],
+     main = "Schoenfeld Residuals — ecusv_3 (Main, Imp 1)")
+abline(h = coef(fit_1)["ecusv_3"], col = "red", lwd = 2, lty = 3)
+
+plot(zph_1[3],
+     main = "Schoenfeld Residuals — ecusv_3 (Main, Imp 1)")
+abline(h = coef(fit_1)["ecusv_3"], col = "red", lwd = 2, lty = 3)
+
+plot(zph_1[4],
+     main = "Schoenfeld Residuals — ecusv_3 (Main, Imp 1)")
+abline(h = coef(fit_1)["ecusv_3"], col = "red", lwd = 2, lty = 3)
+
+plot(zph_1[5],
+     main = "Schoenfeld Residuals — ecusv_3 (Main, Imp 1)")
+abline(h = coef(fit_1)["ecusv_3"], col = "red", lwd = 2, lty = 3)
+
+plot(zph_1[6],
+     main = "Schoenfeld Residuals — ecusv_3 (Main, Imp 1)")
+abline(h = coef(fit_1)["ecusv_3"], col = "red", lwd = 2, lty = 3)
+
+
+
+
+```
+
+
+
+
+# Univariable Kaplan-Meier curve of vaping relapse survival by quitting confidence levels (low, high)
+
+```{r}
+
+# no missing values in self-efficacy variable
+sum(is.na(stopvape$ecusv_3))
+
+# Create confidence group on unimputed data
+stopvape_km <- stopvape %>%
+  filter(!is.na(ecusv_3)) %>%   # remove only if NAs exist; safe to keep regardless
+  mutate(conf_group = cut(ecusv_3,
+                          breaks = c(0, 5, 10),
+                          labels = c("Low", "High"),
+                          right  = TRUE))
+
+# Fit KM
+surv_unimputed <- survfit(Surv(Time.elapsed, status) ~ conf_group,
+                          data = stopvape_km)
+
+# --- Time point: 48 hours = 2 days ---
+summary(surv_unimputed, times = 2)
+
+# --- Time point: 7 days ---
+summary(surv_unimputed, times = 7)
+
+# Plot KM curve
+km_plot <- ggsurvplot(
+  surv_unimputed,
+  data       = stopvape_km,
+  conf.int   = TRUE,
+  pval = TRUE,
+  pval.coord = c(38, 0.3),
+  risk.table = TRUE,
+  xlim       = c(0, 45),
+  break.time.by = 7,
+  xlab       = "Time Elapsed (days)",
+  ylab       = "Probability of Remaining Vape-Free",
+  title      = "KM Curve by Self-Efficacy Group",
+  legend.labs = c("Low Self-Efficacy", "High Self-Efficacy"),
+  palette    = c("steelblue", "red3")
+)
+
+# Save as PNG
+ggsave(
+  filename = "km_curve_unimputed.png",
+  plot = km_plot$plot,   # IMPORTANT: extract the ggplot component
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+
+### log-rank MH test → highly significant difference between the survival curves of the groups
+```{r}
+#log-rank MH test 
+#compute the test of the difference between the survival curves
+sur.mh <- survdiff(Surv(Time.elapsed, status) ~ conf_group, data = stopvape)
+sur.mh 
+
+```
+
+
+Report the proportion of episodes that are censored due to inactivity/last-entry rules and summarize engagement patterns over time.
+
+stopvape_firstquit: This is the dataset containing the first quit challenges  for each participant (n=389). 
+
+stopvape_3moodcraving: This is the dataset containing at least 3 mood or craving ratings per challenges. It contains 126 challenge data of 111 participants.
+```{r}
+stopvape_firstquit <- read_csv("unimputed_dataset_allages_firstquit(in).csv", col_names = TRUE)
+
+# prepare data
+# Convert categorical variables to a factor with proper labels
+stopvape_firstquit $gender_adj <- factor(stopvape_firstquit$gender,
+                            levels = c(0, 1, 2),
+                            labels = c("Men", "Women", "Others"))
+stopvape_firstquit $sexorient_adj <- factor(stopvape_firstquit$sexorient,
+                               levels = c(0, 1, 2),
+                               labels = c("Heterosexual", "LGBTQ", "Asexual/Undisclosed"))
+stopvape_firstquit <- stopvape_firstquit %>%
+  mutate(age = ifelse(nchar(as.character(age)) > 3, NA, age))
+
+
+
+summary(stopvape_firstquit)
+
+#split into groups low and high quitting confidence 
+stopvape_firstquit$conf_group <- cut(stopvape_firstquit$ecusv_3,
+                           breaks = c(0, 5, 10),
+                           labels = c("Low", "High"),
+                           right = TRUE)
+
+```
+
+```{r}
+(v <- names(stopvape_firstquit )[c(2, 14, 32, 33, 43, 44, 42, 12, 13, 28, 40, 41)])
+set.seed(3098) 
+stopvape_firstquit.mice <- mice(stopvape_firstquit[,v], method = "cart") # large number of unbalanced factor variables, use cart method 
+stopvape_firstquit.mice$method
+plot(stopvape_firstquit.mice)
+
+densityplot(stopvape_firstquit.mice) # for continuous variables
+densityplot(stopvape_firstquit.mice, ~ ecusv_3|.imp) #look at self-confidence by imputation
+
+
+
+```
+
+```{r}
+# return all imputed datasets combined into one big data frame
+stopvape_firstquit.pooled <- complete(stopvape_firstquit.mice, method = "long") 
+summary (stopvape_firstquit.pooled)
+nrow(stopvape_firstquit.pooled)
+
+surv_elapsed <- Surv(time = stopvape_firstquit.pooled$Time.elapsed, 
+                 event = stopvape_firstquit.pooled$status)
+
+
+fit1_firstquit <- coxph(surv_elapsed~ecusv_3,cluster(stopvape_firstquit.pooled$userid),data=stopvape_firstquit.pooled)
+fit2_firstquit  <- coxph(surv_elapsed~ecusv_3+age+country+gender_adj+sexorient_adj+race+ecu17_1+ecusv_2+mhealth1_1,cluster(stopvape_firstquit.pooled$userid),data=stopvape_firstquit.pooled)
+fit3_firstquit  <- coxph(surv_elapsed~ecusv_3*gender_adj,cluster(stopvape_firstquit.pooled$userid),data=stopvape_firstquit.pooled)
+
+fitdemo_firstquit  <- coxph(surv_elapsed~ecusv_3+age+country+gender_adj+sexorient_adj+race,cluster(stopvape_firstquit.pooled$userid),data=stopvape_firstquit.pooled)
+
+
+fit1_firstquit
+fit2_firstquit
+fit3_firstquit
+fitdemo_firstquit
+
+#95% CI
+exp(confint(fit1_firstquit))
+exp(confint(fit2_firstquit))
+exp(confint(fit3_firstquit))
+exp(confint(fitdemo_firstquit))
+
+#Run AIC to compare predictive performance of models
+AIC(fit1_firstquit)
+AIC(fit2_firstquit)
+AIC(fit3_firstquit)
+AIC(fitdemo_firstquit)
+
+
+```
+
+
+# Sensitvity analysis: Challenge episodes with 3 cravings or more 
+# prepare data
+```{r}
+
+stopvape_3moodcraving <-read_csv("unimputed_dataset_allages_3moodcraving(in).csv", col_names = TRUE)
+
+
+# Convert categorical variables to a factor with proper labels
+stopvape_3moodcraving $gender_adj <- factor(stopvape_3moodcraving$gender,
+                            levels = c(0, 1, 2),
+                            labels = c("Men", "Women", "Others"))
+stopvape_3moodcraving $sexorient_adj <- factor(stopvape_3moodcraving$sexorient,
+                               levels = c(0, 1, 2),
+                               labels = c("Heterosexual", "LGBTQ", "Asexual/Undisclosed"))
+stopvape_3moodcraving <- stopvape_3moodcraving %>%
+  mutate(age = ifelse(nchar(as.character(age)) > 3, NA, age))
+
+
+
+summary(stopvape_3moodcraving)
+
+#split into groups low and high quitting confidence 
+stopvape_3moodcraving$conf_group <- cut(stopvape_3moodcraving$ecusv_3,
+                           breaks = c(0, 5, 10),
+                           labels = c("Low", "High"),
+                           right = TRUE)
+
+# Filter to unique user IDs, create confidence groups, and get descriptive statistics
+stopvape_3moodcraving %>%
+  distinct(userid, .keep_all = TRUE) %>%  # Keep only unique userids
+  mutate(conf_group = cut(ecusv_3,
+                         breaks = c(0, 5, 10),
+                         labels = c("Low", "High"),
+                         right = TRUE)) %>%
+  tbl_summary(
+    by = conf_group,  # Group by confidence level
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    )
+  ) %>%
+  add_p() %>%        # Add p-values for group comparisons
+  add_overall()      # Add overall column
+```
+
+```{r}
+(v <- names(stopvape_3moodcraving)[c(2, 14, 32, 33, 43, 44, 42, 12, 13, 28, 40, 41)])
+set.seed(3098) 
+stopvape_3moodcraving.mice <- mice(stopvape_3moodcraving[,v], method = "cart") 
+
+stopvape_3moodcraving.mice$method
+plot(stopvape_3moodcraving.mice)
+
+densityplot(stopvape_3moodcraving.mice) # for continuous variables
+densityplot(stopvape_3moodcraving.mice, ~ ecusv_3|.imp) #look at self-confidence by imputation
+
+```
+
+```{r}
+fit1_3moodcraving <- with(
+  stopvape_3moodcraving.mice,
+  coxph(Surv(Time.elapsed, status) ~ ecusv_3 + cluster(userid))
+)
+
+fit2_3moodcraving <- with(
+  stopvape_3moodcraving.mice,
+  coxph(Surv(Time.elapsed, status) ~
+          ecusv_3 + age + country + gender_adj +
+          sexorient_adj + race + ecu17_1 +
+          ecusv_2 + mhealth1_1 +
+          cluster(userid))
+)
+
+fit3_3moodcraving <- with(
+  stopvape_3moodcraving.mice,
+  coxph(Surv(Time.elapsed, status) ~
+          ecusv_3 * gender_adj +
+          cluster(userid))
+)
+
+fitdemo_3moodcraving <- with(
+  stopvape_3moodcraving.mice,
+  coxph(Surv(Time.elapsed, status) ~
+          ecusv_3 + age + country +
+          gender_adj + sexorient_adj + race +
+          cluster(userid))
+)
+
+pooled_fit1_3moodcraving <- pool(fit1_3moodcraving)
+pooled_fit2_3moodcraving <- pool(fit2_3moodcraving)
+pooled_fit3_3moodcraving <- pool(fit3_3moodcraving)
+pooled_fitdemo_3moodcraving <- pool(fitdemo_3moodcraving)
+
+summary(pooled_fit1_3moodcraving, conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_fit2_3moodcraving, conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_fit3_3moodcraving, conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_fitdemo_3moodcraving, conf.int = TRUE, exponentiate = TRUE)
+
+```
+
+
+
+```{r}
+stopvape_relapsed <- stopvape %>%
+  filter(status != 0) %>%
+  mutate(
+    gender_adj = factor(gender,
+                        levels = c(0, 1, 2),
+                        labels = c("Men", "Women", "Others")),
+    sexorient_adj = factor(sexorient,
+                           levels = c(0, 1, 2),
+                           labels = c("Heterosexual", "LGBTQ", "Asexual/Undisclosed")),
+    age = ifelse(nchar(as.character(age)) > 3, NA, age)
+  )
+
+stopvape_relapsed
+
+```
+
+
+# prepare data
+```{r}
+# Convert categorical variables to a factor with proper labels
+stopvape_relapsed$gender_adj <- factor(stopvape_relapsed$gender,
+                            levels = c(0, 1, 2),
+                            labels = c("Men", "Women", "Others"))
+stopvape_relapsed$sexorient_adj <- factor(stopvape_relapsed$sexorient,
+                               levels = c(0, 1, 2),
+                               labels = c("Heterosexual", "LGBTQ", "Asexual/Undisclosed"))
+# 
+# stopvape_relapsed <- stopvape_relapsed %>%
+#   mutate(age = ifelse(nchar(as.character(age)) > 3, NA, age))
+
+
+summary(stopvape_relapsed$age)
+```
+
+```{r}
+#split into groups low and high quitting confidence 
+stopvape_relapsed$conf_group <- cut(stopvape_relapsed$ecusv_3,
+                           breaks = c(0, 5, 10),
+                           labels = c("Low", "High"),
+                           right = TRUE)
+
+
+# Filter to unique user IDs, create confidence groups, and get descriptive statistics
+stopvape_relapsed %>%
+  distinct(userid, .keep_all = TRUE) %>%  # Keep only unique userids
+  mutate(conf_group = cut(ecusv_3,
+                         breaks = c(0, 5, 10),
+                         labels = c("Low", "High"),
+                         right = TRUE)) %>%
+  tbl_summary(
+    by = conf_group,  # Group by confidence level
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    )
+  ) %>%
+  add_p() %>%        # Add p-values for group comparisons
+  add_overall()      # Add overall column
+```
+
+
+```{r}
+(v <- names(stopvape_relapsed)[c(2, 14, 32, 33, 43, 44, 42, 12, 13, 28, 40, 41)])
+set.seed(3098) 
+
+# stopvape_relapsed.mice  <- mice(stopvape_relapsed,
+#                   seed  = 3098,
+#                   m     = 5,
+#                   print = F)
+stopvape_relapsed.mice <- mice(stopvape_relapsed[,v], method = "cart") # large number of unbalanced factor variables, use cart method
+stopvape_relapsed.mice$method
+plot(stopvape_relapsed.mice)
+
+densityplot(stopvape_relapsed.mice) # for continuous variables
+densityplot(stopvape_relapsed.mice, ~ ecusv_3|.imp) #look at self-confidence by imputation
+
+```
+
+```{r}
+fit1_relapsed <- with(
+  stopvape_relapsed.mice,
+  coxph(Surv(Time.elapsed, status) ~ ecusv_3 + cluster(userid))
+)
+
+fit2_relapsed <- with(
+  stopvape_relapsed.mice,
+  coxph(Surv(Time.elapsed, status) ~
+          ecusv_3 + age + country + gender_adj +
+          sexorient_adj + race + ecu17_1 +
+          ecusv_2 + mhealth1_1 +
+          cluster(userid))
+)
+
+fit3_relapsed <- with(
+  stopvape_relapsed.mice,
+  coxph(Surv(Time.elapsed, status) ~
+          ecusv_3 * gender_adj +
+          cluster(userid))
+)
+
+fitdemo_relapsed <- with(
+  stopvape_relapsed.mice,
+  coxph(Surv(Time.elapsed, status) ~
+          ecusv_3 + age + country +
+          gender_adj + sexorient_adj + race +
+          cluster(userid))
+)
+
+pooled_fit1_relapsed <- pool(fit1_relapsed)
+pooled_fit2_relapsed <- pool(fit2_relapsed)
+pooled_fit3_relapsed <- pool(fit3_relapsed)
+pooled_fitdemo_relapsed <- pool(fitdemo_relapsed)
+
+summary(pooled_fit1_relapsed, conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_fit2_relapsed, conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_fit3_relapsed, conf.int = TRUE, exponentiate = TRUE)
+summary(pooled_fitdemo_relapsed, conf.int = TRUE, exponentiate = TRUE)
+```
+
+```{r}
+
+# return all imputed datasets combined into one big data frame
+stopvape_relapsed.pooled <- complete(stopvape_relapsed.mice, method = "long") 
+summary (stopvape_relapsed.pooled)
+nrow(stopvape_relapsed.pooled)
+
+surv_elapsed <- Surv(time = stopvape_relapsed.pooled$Time.elapsed, 
+                 event = stopvape_relapsed.pooled$status)
+
+
+fit1_relapsed <- coxph(surv_elapsed~ecusv_3,cluster(stopvape_relapsed.pooled$userid),data=stopvape_relapsed.pooled)
+fit2_relapsed <- coxph(surv_elapsed~ecusv_3+age+country+gender_adj+sexorient_adj+race+ecu17_1+ecusv_2+mhealth1_1,cluster(stopvape_relapsed.pooled$userid),data=stopvape_relapsed.pooled)
+fit3_relapsed <- coxph(surv_elapsed~ecusv_3*gender_adj,cluster(stopvape_relapsed.pooled$userid),data=stopvape_relapsed.pooled)
+
+fitdemo_relapsed <- coxph(surv_elapsed~ecusv_3+age+country+gender_adj+sexorient_adj+race,cluster(stopvape_relapsed.pooled$userid),data=stopvape_relapsed.pooled)
+
+fit1_relapsed
+fit2_relapsed
+fit3_relapsed
+fitdemo_relapsed
+
+#95% CI
+exp(confint(fit1_relapsed))
+exp(confint(fit2_relapsed))
+exp(confint(fit3_relapsed))
+exp(confint(fitdemo_relapsed))
+
+#Run AIC to compare predictive performance of models
+AIC(fit1_relapsed)
+AIC(fit2_relapsed)
+AIC(fit3_relapsed)
+AIC(fitdemo_relapsed)
+
+```
+
